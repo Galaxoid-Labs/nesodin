@@ -1,0 +1,30 @@
+# Build output
+nesodin
+nesodin.exe
+*.o
+*.obj
+
+# ROMs (except nestest)
+*.nes
+!nestest.nes
+
+# Save files
+*.sav
+
+# Exported images
+pattern_table_*.png
+sprites.png
+all_tiles.png
+
+# Test files
+nestest.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*~
