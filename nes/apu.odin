@@ -123,6 +123,10 @@ Pulse_Channel :: struct {
 	timer_value:   u16,
 
 	channel_num:   u8,  // 1 or 2 (affects sweep negate behavior)
+
+	// PolyBLEP state
+	phase:         f64,  // 0.0 to 1.0
+	last_output:   f32,  // Previous sample for edge detection
 }
 
 Triangle_Channel :: struct {
@@ -190,13 +194,14 @@ APU :: struct {
 	cycle:    u64,
 
 	// Audio output
-	sample_rate: f64, // CPU cycles per audio sample
-	filter_hp1: Filter,
-	filter_hp2: Filter,
-	filter_lp:  Filter,
-	sample_buf: [8192]f32,
-	write_pos:  u32,
-	read_pos:   u32,
+	sample_rate:  f64, // CPU cycles per audio sample
+	filter_hp1:   Filter,
+	filter_hp2:   Filter,
+	filter_lp:    Filter,
+	prev_output:  f32,  // Previous mixed sample for smoothing
+	sample_buf:   [16384]f32,
+	write_pos:    u32,
+	read_pos:     u32,
 
 	bus: ^Bus,
 }
@@ -374,6 +379,66 @@ pulse_output :: proc(p: ^Pulse_Channel) -> u8 {
 	if duty[p.duty][p.duty_pos] == 0 { return 0 }
 	if p.timer_period < 8 || p.timer_period > 0x7FF { return 0 }
 	return envelope_output(&p.envelope)
+}
+
+// Duty cycle widths as fractions for PolyBLEP
+DUTY_WIDTHS :: [4]f64{0.125, 0.25, 0.5, 0.75}
+
+// PolyBLEP correction: smooths discontinuities in a band-limited way
+// t should be in [0, 1) representing phase position
+// dt is the phase increment per sample
+polyblep :: proc(t: f64, dt: f64) -> f64 {
+	if t < dt {
+		// Rising edge: just after transition
+		nt := t / dt
+		return nt + nt - nt * nt - 1.0
+	} else if t > 1.0 - dt {
+		// Falling edge: just before transition
+		nt := (t - 1.0) / dt
+		return nt * nt + nt + nt + 1.0
+	}
+	return 0.0
+}
+
+// Generate a band-limited pulse sample using PolyBLEP
+pulse_output_blep :: proc(p: ^Pulse_Channel, sample_rate: f64) -> f32 {
+	if !p.enabled || p.length_counter == 0 { return 0 }
+	if p.timer_period < 8 || p.timer_period > 0x7FF { return 0 }
+
+	vol := f32(envelope_output(&p.envelope))
+	if vol == 0 { return 0 }
+
+	// Frequency of the pulse channel
+	// NES pulse period → frequency: f = CPU_FREQ / (16 * (period + 1))
+	// (period is the 11-bit timer, pulses tick at half CPU rate, 8 steps per cycle)
+	freq := CPU_FREQ / (16.0 * (f64(p.timer_period) + 1.0))
+	dt := freq / sample_rate  // Phase increment per sample
+
+	if dt <= 0 || dt >= 0.5 { return 0 } // Nyquist limit
+
+	// Advance phase
+	p.phase += dt
+	for p.phase >= 1.0 { p.phase -= 1.0 }
+
+	dw := DUTY_WIDTHS
+	duty_width := dw[p.duty]
+
+	// Naive square wave: high if phase < duty_width
+	sample: f64 = -1.0
+	if p.phase < duty_width {
+		sample = 1.0
+	}
+
+	// Apply PolyBLEP correction at both edges
+	sample += polyblep(p.phase, dt)                             // Rising edge at phase=0
+	falling_phase := p.phase - duty_width + 1.0
+	for falling_phase >= 1.0 { falling_phase -= 1.0 }
+	for falling_phase < 0.0 { falling_phase += 1.0 }
+	sample -= polyblep(falling_phase, dt) // Falling edge at duty_width
+
+	// Scale to NES volume range (0 to vol)
+	// Map [-1, 1] → [0, vol]
+	return f32((sample + 1.0) * 0.5) * vol / 15.0
 }
 
 pulse_tick :: proc(p: ^Pulse_Channel) {
@@ -609,13 +674,24 @@ apu_step_frame_counter :: proc(apu: ^APU) {
 // ---- Mixer ----
 
 apu_mix :: proc(apu: ^APU) -> f32 {
-	p1 := pulse_output(&apu.pulse1)
-	p2 := pulse_output(&apu.pulse2)
+	// Pulse channels use PolyBLEP for band-limited output
+	p1 := pulse_output_blep(&apu.pulse1, SAMPLE_RATE)
+	p2 := pulse_output_blep(&apu.pulse2, SAMPLE_RATE)
+
+	// Triangle, noise, DMC use standard discrete output
 	t  := triangle_output(&apu.triangle)
 	n  := noise_output(&apu.noise)
 	d  := apu.dmc.output_level
 
-	pulse_out := pulse_table[p1 + p2]
+	// Pulse: PolyBLEP outputs are already in ~[0, 1] range scaled by volume
+	// Map to match the NES mixer curve
+	pulse_sum := p1 + p2
+	pulse_out: f32 = 0
+	if pulse_sum > 0 {
+		// Scale to match the lookup table range (~0 to 0.25)
+		pulse_out = 95.52 / (8128.0 / (pulse_sum * 15.0) + 100.0)
+	}
+
 	tnd_out := tnd_table[3 * u16(t) + 2 * u16(n) + u16(d)]
 	return pulse_out + tnd_out
 }
@@ -648,12 +724,19 @@ apu_step :: proc(apu: ^APU) {
 	s2 := u64(f64(cycle2) / apu.sample_rate)
 	if s1 != s2 {
 		sample := apu_mix(apu)
+
+		// Smooth volume transitions — prevents pops from abrupt changes
+		// (channel on/off, envelope steps, length counter expiry)
+		SMOOTH :: 0.65
+		sample = SMOOTH * apu.prev_output + (1.0 - SMOOTH) * sample
+		apu.prev_output = sample
+
 		sample = filter_step(&apu.filter_hp1, sample)
 		sample = filter_step(&apu.filter_hp2, sample)
 		sample = filter_step(&apu.filter_lp, sample)
 
-		if apu.write_pos - apu.read_pos < 8192 {
-			apu.sample_buf[apu.write_pos & 8191] = sample
+		if apu.write_pos - apu.read_pos < 16384 {
+			apu.sample_buf[apu.write_pos & 16383] = sample
 			apu.write_pos += 1
 		}
 	}
@@ -664,12 +747,20 @@ apu_samples_available :: proc(apu: ^APU) -> u32 {
 	return apu.write_pos - apu.read_pos
 }
 
+// Read a single sample (used by audio callback)
+apu_read_sample :: proc(apu: ^APU) -> f32 {
+	if apu.write_pos == apu.read_pos { return 0 }
+	sample := apu.sample_buf[apu.read_pos & 16383]
+	apu.read_pos += 1
+	return sample
+}
+
 // Read samples into output buffer
 apu_read_samples :: proc(apu: ^APU, out: []f32) -> u32 {
 	available := apu_samples_available(apu)
 	count := min(available, u32(len(out)))
 	for i in u32(0)..<count {
-		out[i] = apu.sample_buf[(apu.read_pos + i) & 8191]
+		out[i] = apu.sample_buf[(apu.read_pos + i) & 16383]
 	}
 	apu.read_pos += count
 	return count

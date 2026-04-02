@@ -12,7 +12,7 @@ SCREEN_W :: 256 * SCALE
 SCREEN_H :: 240 * SCALE
 
 AUDIO_SAMPLE_RATE :: 44100
-AUDIO_BUFFER_SIZE :: 1024
+AUDIO_BUFFER_SIZE :: 512
 
 MAX_SAVE_SLOTS :: 4
 
@@ -24,10 +24,41 @@ Menu_Action :: enum {
 	Quit,
 }
 
+// Global APU pointer for audio callback (callback runs on audio thread)
+g_apu: ^nes.APU
+
+// Audio callback — pulls samples directly from APU ring buffer (no gaps)
+// Runs on the audio thread, must be "c" calling convention
+audio_callback :: proc "c" (buffer: rawptr, frames: c.uint) {
+	if g_apu == nil { return }
+	samples := ([^]f32)(buffer)
+
+	// Direct ring buffer access — no Odin context needed
+	n := u32(frames)
+	available := g_apu.write_pos - g_apu.read_pos
+	count := min(available, n)
+
+	for i in u32(0)..<count {
+		samples[i] = g_apu.sample_buf[(g_apu.read_pos + i) & 16383]
+	}
+	g_apu.read_pos += count
+
+	// Fill remainder with last sample to avoid pops
+	if count > 0 && count < n {
+		last := samples[count - 1]
+		for i in count..<n {
+			samples[i] = last
+		}
+	} else if count == 0 {
+		for i in u32(0)..<n {
+			samples[i] = 0
+		}
+	}
+}
+
 Platform :: struct {
 	texture:      rl.Texture2D,
 	audio_stream: rl.AudioStream,
-	audio_buf:    [AUDIO_BUFFER_SIZE]f32,
 
 	// CRT shader
 	crt_shader:   rl.Shader,
@@ -42,9 +73,6 @@ Platform :: struct {
 	fast_forward: bool,
 	rom_name:     string,
 
-	// Pattern viewer
-	viewer_open:    bool,
-	viewer_palette: u8,
 }
 
 platform_init :: proc(p: ^Platform, rom_path: string) {
@@ -76,23 +104,20 @@ platform_init :: proc(p: ^Platform, rom_path: string) {
 	rl.SetShaderValue(p.crt_shader, p.crt_res_loc, &res, .VEC2)
 	p.crt_enabled = false
 
-	// Init audio
+	// Init audio with callback-based streaming (gapless)
 	rl.InitAudioDevice()
 	rl.SetAudioStreamBufferSizeDefault(AUDIO_BUFFER_SIZE)
 	p.audio_stream = rl.LoadAudioStream(AUDIO_SAMPLE_RATE, 32, 1)
 	p.volume = 0.5
 	rl.SetAudioStreamVolume(p.audio_stream, p.volume)
+	rl.SetAudioStreamCallback(p.audio_stream, audio_callback)
 	rl.PlayAudioStream(p.audio_stream)
 
 	// Menu defaults
 	p.save_slot = 0
 
-	// Crisp font rendering — disable bilinear filtering on default font
-	default_font := rl.GetFontDefault()
-	rl.SetTextureFilter(default_font.texture, .POINT)
-
-	// GUI style
-	rl.GuiSetStyle(.DEFAULT, c.int(rl.GuiDefaultProperty.TEXT_SIZE), 16)
+	// GUI style — use 20px (2x the default 10px bitmap font) for crisp scaling
+	rl.GuiSetStyle(.DEFAULT, c.int(rl.GuiDefaultProperty.TEXT_SIZE), 20)
 }
 
 platform_shutdown :: proc(p: ^Platform) {
@@ -194,7 +219,7 @@ draw_menu :: proc(p: ^Platform) -> Menu_Action {
 
 	// Menu panel
 	panel_w: f32 = 380
-	panel_h: f32 = 640
+	panel_h: f32 = 580
 	panel_x: f32 = (SCREEN_W - panel_w) / 2
 	panel_y: f32 = (SCREEN_H - panel_h) / 2
 
@@ -279,16 +304,15 @@ draw_menu :: proc(p: ^Platform) -> Menu_Action {
 		{"Right Shift", "Select"},
 		{"Escape",      "Menu"},
 		{"F1",          "CRT Shader"},
-		{"F2",          "Pattern Viewer"},
 		{"F5 / F9",     "Save / Load State"},
 		{"F12",         "Reset"},
 		{"Tab (hold)",  "Fast Forward"},
 	}
 
 	for ctrl in controls {
-		rl.DrawText(ctrl.key, i32(x), i32(y), 14, {180, 180, 200, 255})
-		rl.DrawText(ctrl.action, i32(x + 120), i32(y), 14, {140, 140, 160, 255})
-		y += 16
+		rl.DrawText(ctrl.key, i32(x), i32(y), 10, {180, 180, 200, 255})
+		rl.DrawText(ctrl.action, i32(x + 110), i32(y), 10, {140, 140, 160, 255})
+		y += 14
 	}
 
 	// Close menu on action
@@ -300,16 +324,9 @@ draw_menu :: proc(p: ^Platform) -> Menu_Action {
 	return action
 }
 
-// Push audio samples from APU to raylib stream
+// Set the APU pointer for the audio callback
 platform_update_audio :: proc(p: ^Platform, apu: ^nes.APU) {
-	for rl.IsAudioStreamProcessed(p.audio_stream) {
-		available := nes.apu_samples_available(apu)
-		if available == 0 { break }
-
-		count := min(available, AUDIO_BUFFER_SIZE)
-		nes.apu_read_samples(apu, p.audio_buf[:count])
-		rl.UpdateAudioStream(p.audio_stream, raw_data(&p.audio_buf), i32(count))
-	}
+	g_apu = apu
 }
 
 // Update window title with ROM name
@@ -366,7 +383,7 @@ platform_render_drop_prompt :: proc(p: ^Platform) {
 	rl.EndDrawing()
 }
 
-// Map keyboard to NES controller buttons (only when menu is closed)
+// Map keyboard and gamepad to NES controller buttons
 platform_read_input :: proc(p: ^Platform, controller: ^nes.Controller) {
 	if p.menu_open {
 		controller.buttons = {}
@@ -374,6 +391,8 @@ platform_read_input :: proc(p: ^Platform, controller: ^nes.Controller) {
 	}
 
 	controller.buttons = {}
+
+	// Keyboard
 	if rl.IsKeyDown(.RIGHT)       { controller.buttons += {.Right} }
 	if rl.IsKeyDown(.LEFT)        { controller.buttons += {.Left} }
 	if rl.IsKeyDown(.UP)          { controller.buttons += {.Up} }
@@ -382,4 +401,37 @@ platform_read_input :: proc(p: ^Platform, controller: ^nes.Controller) {
 	if rl.IsKeyDown(.X)           { controller.buttons += {.A} }
 	if rl.IsKeyDown(.ENTER)       { controller.buttons += {.Start} }
 	if rl.IsKeyDown(.RIGHT_SHIFT) { controller.buttons += {.Select} }
+
+	// Gamepad (player 1 = gamepad 0)
+	if rl.IsGamepadAvailable(0) {
+		// D-pad
+		if rl.IsGamepadButtonDown(0, .LEFT_FACE_RIGHT) { controller.buttons += {.Right} }
+		if rl.IsGamepadButtonDown(0, .LEFT_FACE_LEFT)  { controller.buttons += {.Left} }
+		if rl.IsGamepadButtonDown(0, .LEFT_FACE_UP)    { controller.buttons += {.Up} }
+		if rl.IsGamepadButtonDown(0, .LEFT_FACE_DOWN)  { controller.buttons += {.Down} }
+
+		// Left stick (with deadzone)
+		DEADZONE :: 0.3
+		stick_x := rl.GetGamepadAxisMovement(0, .LEFT_X)
+		stick_y := rl.GetGamepadAxisMovement(0, .LEFT_Y)
+		if stick_x >  DEADZONE { controller.buttons += {.Right} }
+		if stick_x < -DEADZONE { controller.buttons += {.Left} }
+		if stick_y < -DEADZONE { controller.buttons += {.Up} }
+		if stick_y >  DEADZONE { controller.buttons += {.Down} }
+
+		// Face buttons: B = west/left, A = south/down (natural NES layout)
+		if rl.IsGamepadButtonDown(0, .RIGHT_FACE_LEFT)  { controller.buttons += {.B} } // X/Square
+		if rl.IsGamepadButtonDown(0, .RIGHT_FACE_DOWN)  { controller.buttons += {.A} } // A/Cross
+		// Also map right face buttons as alternatives
+		if rl.IsGamepadButtonDown(0, .RIGHT_FACE_RIGHT) { controller.buttons += {.A} } // B/Circle
+		if rl.IsGamepadButtonDown(0, .RIGHT_FACE_UP)    { controller.buttons += {.B} } // Y/Triangle
+
+		// Start / Select
+		if rl.IsGamepadButtonDown(0, .MIDDLE_RIGHT) { controller.buttons += {.Start} }
+		if rl.IsGamepadButtonDown(0, .MIDDLE_LEFT)  { controller.buttons += {.Select} }
+
+		// Shoulder buttons as A/B alternatives
+		if rl.IsGamepadButtonDown(0, .RIGHT_TRIGGER_1) { controller.buttons += {.A} }
+		if rl.IsGamepadButtonDown(0, .LEFT_TRIGGER_1)  { controller.buttons += {.B} }
+	}
 }

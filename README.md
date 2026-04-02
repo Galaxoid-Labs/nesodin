@@ -6,13 +6,14 @@ A NES (Nintendo Entertainment System) emulator written in [Odin](https://odin-la
 
 - **CPU**: Full 6502 instruction set (official + unofficial opcodes) — 100% nestest passing
 - **PPU**: Background and sprite rendering, scrolling, sprite 0 hit, 8x16 sprites
-- **APU**: All 5 audio channels (2x pulse, triangle, noise, DMC) with hardware-accurate filtering
+- **APU**: All 5 audio channels with PolyBLEP synthesis and hardware-accurate filtering
 - **11 mappers**: Covers ~85-90% of the licensed NES library
 - **CRT shader**: Optional post-processing with scanlines, curvature, and shadow mask
 - **Save states**: 4 slots with quick save/load
 - **Battery saves**: Automatic SRAM persistence for games like Zelda and Final Fantasy
-- **Pattern viewer**: Inspect CHR tiles and export sprites as PNG
+- **Gamepad support**: Xbox, PlayStation, Switch Pro controllers — plug and play
 - **Drag and drop**: Drop a `.nes` file onto the window to play
+- **Menu overlay**: In-game menu with settings, save/load, volume, and controls reference
 
 ## Supported Mappers
 
@@ -50,7 +51,7 @@ odin build . -o:speed
 
 ## Controls
 
-### Game
+### Keyboard
 
 | Key | NES Button |
 |-----|-----------|
@@ -60,28 +61,30 @@ odin build . -o:speed
 | Enter | Start |
 | Right Shift | Select |
 
+### Gamepad
+
+| Gamepad | NES Button |
+|---------|-----------|
+| D-pad / Left stick | D-pad |
+| A/Cross or B/Circle | A |
+| X/Square or Y/Triangle | B |
+| RB/R1 | A |
+| LB/L1 | B |
+| Start | Start |
+| Select/Back | Select |
+
 ### Emulator
 
 | Key | Action |
 |-----|--------|
 | Escape | Toggle menu (pauses game) |
 | F1 | Toggle CRT shader |
-| F2 | Pattern viewer / sprite extraction |
 | F5 | Quick save state |
 | F9 | Quick load state |
 | F12 | Reset console |
 | Tab (hold) | Fast forward (3x speed) |
 
-The menu (Escape) also shows all controls for reference.
-
-## Pattern Viewer & Sprite Extraction
-
-Press **F2** to open the pattern viewer. It shows:
-
-- Both pattern tables ($0000 and $1000) rendered with the selected palette
-- All 8 NES palettes — click to switch which one renders the tiles
-- Current OAM sprites (all 64)
-- **Export buttons** to save pattern tables, sprite sheets, or all tiles as PNG files
+All controls are also shown in the in-game menu overlay.
 
 ## Testing
 
@@ -109,7 +112,6 @@ nesodin/
 │   └── mappers/           # Cartridge mapper implementations
 └── platform/              # Raylib integration
     ├── platform.odin      # Window, audio, input, menu (raygui)
-    ├── viewer.odin        # Pattern table viewer, sprite export
     └── crt.glsl           # CRT post-processing shader
 ```
 

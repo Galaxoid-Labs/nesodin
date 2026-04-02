@@ -4,7 +4,6 @@ import "core:fmt"
 import "core:os"
 import "core:mem"
 import "core:strings"
-import rl "vendor:raylib"
 import "nes"
 import "platform"
 
@@ -146,12 +145,6 @@ main :: proc() {
 			}
 		}
 
-		// F2 toggles pattern viewer (handled here so it works in all modes)
-		if rl.IsKeyPressed(.F2) && rom_loaded {
-			p.viewer_open = !p.viewer_open
-			p.paused = p.viewer_open || p.menu_open
-		}
-
 		if rom_loaded {
 			// Read input
 			platform.platform_read_input(&p, &console.bus.controller[0])
@@ -168,13 +161,8 @@ main :: proc() {
 			// Audio
 			platform.platform_update_audio(&p, &console.apu)
 
-			// Render: viewer mode or normal game + menu
-			action := platform.Menu_Action.None
-			if p.viewer_open {
-				platform.platform_render_viewer(&p, &console.ppu)
-			} else {
-				action = platform.platform_render_frame(&p, &console.ppu.framebuffer)
-			}
+			// Render + menu
+			action := platform.platform_render_frame(&p, &console.ppu.framebuffer)
 
 			// Auto-save SRAM every ~5 seconds (300 frames)
 			if console.cartridge.has_battery && len(sav_path) > 0 {

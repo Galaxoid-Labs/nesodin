@@ -7,6 +7,7 @@
 **Tech Stack:**
 - **Language:** Odin
 - **Video/Input/Audio:** `vendor:raylib` v5.5 (bundled with Odin — no external deps)
+- **GUI:** `vendor:raylib` raygui (bundled)
 - **Build:** `odin build .` / `odin run .`
 - **Testing:** `odin test nes/` with `core:testing`
 
@@ -24,7 +25,8 @@
 nesodin/
 ├── CLAUDE.md
 ├── README.md
-├── main.odin                # Entry point, main loop, --nestest mode
+├── .gitignore
+├── main.odin                # Entry point, game loop, save states, drag-and-drop
 ├── nestest_runner.odin      # Nestest CPU validation harness
 ├── nes/
 │   ├── nes.odin             # Top-level NES struct, tick coordination, frame loop
@@ -32,9 +34,9 @@ nesodin/
 │   ├── cpu_opcodes.odin     # All 256 opcodes (151 official + unofficial), addressing modes
 │   ├── ppu.odin             # PPU: rendering, sprites, sprite 0 hit, scrolling, NMI
 │   ├── ppu_bus.odin         # PPU memory bus: pattern tables, nametables, palette mirroring
-│   ├── apu.odin             # APU: pulse, triangle, noise, DMC, frame counter, mixer, filters
+│   ├── apu.odin             # APU: pulse (PolyBLEP), triangle, noise, DMC, mixer, filters
 │   ├── bus.odin             # CPU memory bus: RAM, PPU/APU registers, mapper dispatch
-│   ├── cartridge.odin       # iNES ROM parser, mapper init
+│   ├── cartridge.odin       # iNES ROM parser, mapper init, battery saves
 │   ├── controller.odin      # Joypad shift register
 │   ├── palette.odin         # NES master palette (64 RGB colors)
 │   ├── nes_test.odin        # Unit tests (61 tests)
@@ -52,8 +54,7 @@ nesodin/
 │       ├── mapper_066.odin  # GxROM
 │       └── mapper_071.odin  # Camerica
 └── platform/
-    ├── platform.odin        # Window, texture, audio stream, input, menu, CRT shader
-    ├── viewer.odin          # Pattern table viewer, sprite extraction, PNG export
+    ├── platform.odin        # Window, texture, audio callback, input, menu (raygui), CRT shader
     └── crt.glsl             # CRT post-processing shader
 ```
 
@@ -85,7 +86,7 @@ odin test nes/
 
 ## Controls
 
-**Game:**
+**Game (keyboard):**
 
 | Key | Action |
 |-----|--------|
@@ -95,17 +96,30 @@ odin test nes/
 | Enter | Start |
 | Right Shift | Select |
 
+**Game (gamepad):**
+
+| Gamepad | Action |
+|---------|--------|
+| D-pad / Left stick | D-pad |
+| A/Cross or B/Circle | A |
+| X/Square or Y/Triangle | B |
+| RB/R1 | A |
+| LB/L1 | B |
+| Start | Start |
+| Select/Back | Select |
+
 **Emulator:**
 
 | Key | Action |
 |-----|--------|
 | Escape | Toggle menu (pauses game) |
 | F1 | Toggle CRT shader |
-| F2 | Pattern viewer / sprite extraction |
 | F5 | Quick save state |
 | F9 | Quick load state |
 | F12 | Reset console |
 | Tab (hold) | Fast forward (3x speed) |
+
+All controls are also shown in the in-game menu overlay (Escape).
 
 ---
 
@@ -150,37 +164,35 @@ Covers ~85-90% of the licensed NES library.
 
 ## APU
 
-- 2 pulse channels (duty cycle, envelope, sweep, length counter)
+- 2 pulse channels with PolyBLEP band-limited synthesis
 - Triangle channel (linear counter, 32-step waveform)
 - Noise channel (LFSR, short/long mode, envelope)
 - DMC channel (delta modulation, DMA sample playback)
 - Frame counter (4-step and 5-step modes)
 - Non-linear mixer with precalculated lookup tables
 - Hardware-accurate filter chain (high-pass 37Hz + 14Hz, low-pass 14kHz)
-- Audio streaming via raylib at 44100Hz
+- Volume smoothing to prevent pops from abrupt channel changes
+- Callback-based audio streaming via raylib at 44100Hz (gapless)
 
 ## Platform
 
 - Raylib window at 3x scale (768x720)
 - Texture streaming from PPU framebuffer
 - CRT post-processing shader (barrel distortion, scanlines, shadow mask, vignette)
-- Keyboard input mapping
-- 60 FPS frame pacing
 - Raygui overlay menu (Escape) with save/load slots, volume, settings, controls reference
-- Pattern table viewer (F2) with palette selection and PNG export
-- Sprite sheet extraction from OAM
-- Drag-and-drop ROM loading
-- Save states (4 slots, in-memory snapshots)
+- Drag-and-drop ROM loading (also accepts ROM path as CLI argument)
+- Save states (4 slots, in-memory snapshots with F5/F9)
 - Battery saves (SRAM persisted to .sav files, auto-saves every 5 seconds)
+- Gamepad support (Xbox, PlayStation, Switch Pro — auto-detected)
 - Fast forward (Tab, 3x speed)
+- 60 FPS frame pacing
 
 ---
 
 ## Known Issues
 
 - **Battletoads / Cobra Triangle** (Rare, mapper 7): Freeze at gameplay start. Game polls for sprite 0 hit with a transparent sprite tile. Requires cycle-accurate PPU to resolve.
-- **Audio artifacts**: Minor remaining artifacts in music. BLEP synthesis and callback-based audio would improve quality.
-- **Punch-Out**: Mostly works but some visual glitches remain from MMC2 latch timing.
+- **Audio**: Minor remaining artifacts. Would require cycle-accurate CPU-PPU interleaving to fully resolve.
 
 ---
 
@@ -197,3 +209,6 @@ When the `Cartridge` struct is copied into the `NES` struct, internal slice poin
 
 ### CHR RAM Initialization
 CHR RAM is initialized to `$FF` (non-zero) to approximate real NES power-on state, where RAM contains random data.
+
+### Audio Pipeline
+Pulse channels use PolyBLEP synthesis for band-limited square waves. All channels are mixed through a non-linear lookup table, then passed through a 3-stage filter chain (two high-pass + one low-pass) matching NES hardware. A volume smoother prevents pops from abrupt changes. The audio callback pulls samples directly from a lock-free ring buffer for gapless playback.
